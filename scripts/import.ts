@@ -22,7 +22,7 @@ import {
   computeAgeBracket,
   detectImmeuble,
   normalizeArabicAddress,
-  splitStreetAndNumber,
+  parseAdresseVoie,
   type TrancheAge,
 } from "../lib/import-utils";
 
@@ -39,6 +39,12 @@ const DEFAULT_CENTRES = [
   "ثانوية الشريف الإدريسي التأهيلية",
   "مركز عمر بن الخطاب لمسارات الرياضة",
 ];
+
+// Nom exact de la feuille contenant la liste électorale. NE PAS
+// supposer que c'est la première feuille du classeur : un fichier reçu
+// peut contenir des feuilles de résumé/tableaux croisés placées avant
+// elle (c'est le cas du premier fichier reçu : "Sheet3" vient avant).
+const FEUILLE_LISTE_PAR_DEFAUT = "لائحة الناخبين";
 
 const JOUR_SCRUTIN = new Date("2026-09-23T00:00:00");
 const TAILLE_TOURNEE = 30;
@@ -63,14 +69,16 @@ function parseArgs(argv: string[]) {
   const centres = centresArg
     ? centresArg.slice("--centres=".length).split(",").map((c) => c.trim())
     : DEFAULT_CENTRES;
+  const feuilleArg = argv.find((a) => a.startsWith("--feuille="));
+  const nomFeuille = feuilleArg ? feuilleArg.slice("--feuille=".length) : FEUILLE_LISTE_PAR_DEFAUT;
   const cheminFichier = positional[0];
   if (!cheminFichier) {
     console.error(
-      "Usage : npm run import -- chemin/vers/fichier.xlsx [--dry-run] [--centres=\"نص1,نص2\"]",
+      "Usage : npm run import -- chemin/vers/fichier.xlsx [--dry-run] [--centres=\"نص1,نص2\"] [--feuille=\"nom\"]",
     );
     process.exit(1);
   }
-  return { cheminFichier, dryRun, centres };
+  return { cheminFichier, dryRun, centres, nomFeuille };
 }
 
 /** Essaie plusieurs façons de lire une date de naissance. */
@@ -94,19 +102,25 @@ function parseBirthDate(raw: unknown): Date | null {
   return null;
 }
 
-function readRows(cheminFichier: string): Record<string, unknown>[] {
+function readRows(cheminFichier: string, nomFeuille: string): Record<string, unknown>[] {
   const buffer = readFileSync(cheminFichier);
   const workbook = XLSX.read(buffer, { type: "buffer", cellDates: true });
-  const firstSheetName = workbook.SheetNames[0];
-  const sheet = workbook.Sheets[firstSheetName];
+  if (!workbook.SheetNames.includes(nomFeuille)) {
+    console.error(
+      `Feuille "${nomFeuille}" introuvable dans ce fichier. Feuilles disponibles : ${workbook.SheetNames.join(", ")}`,
+    );
+    console.error(`Utilisez --feuille="nom exact" pour préciser la bonne feuille.`);
+    process.exit(1);
+  }
+  const sheet = workbook.Sheets[nomFeuille];
   return XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "" });
 }
 
 function main() {
-  const { cheminFichier, dryRun, centres } = parseArgs(process.argv.slice(2));
+  const { cheminFichier, dryRun, centres, nomFeuille } = parseArgs(process.argv.slice(2));
 
-  console.log(`Lecture du fichier... (périmètre : ${centres.length} centre(s))`);
-  const rawRows = readRows(cheminFichier);
+  console.log(`Lecture du fichier... (feuille "${nomFeuille}", périmètre : ${centres.length} centre(s))`);
+  const rawRows = readRows(cheminFichier, nomFeuille);
   console.log(`${rawRows.length} lignes lues au total.`);
 
   const lignes: LigneImportee[] = [];
@@ -137,7 +151,7 @@ function main() {
       continue;
     }
     const adresseNormalisee = normalizeArabicAddress(adresseBrute);
-    const { rue, numeroVoie } = splitStreetAndNumber(adresseNormalisee);
+    const { rue, numeroVoie } = parseAdresseVoie(adresseNormalisee);
     const immeuble = detectImmeuble(adresseNormalisee);
 
     const birthDate = parseBirthDate(row[COL_DATE_NAISSANCE]);
@@ -236,13 +250,15 @@ async function importerEnBase(
     }
     bureauxCrees++;
 
-    // Tri par rue puis par numéro (numérique quand c'est possible).
+    // Tri par rue/groupe puis par numéro. { numeric: true } fait que
+    // les nombres inclus dans le texte se comparent comme des nombres
+    // et non lettre par lettre : "قطاع 2" passe bien avant "قطاع 12"
+    // (une comparaison textuelle classique les aurait mis dans le
+    // mauvais ordre, "1" < "2" caractère par caractère).
     const lignesTriees = [...bureau.lignes].sort((a, b) => {
-      const rueCompare = a.rue.localeCompare(b.rue, "ar");
+      const rueCompare = a.rue.localeCompare(b.rue, "ar", { numeric: true });
       if (rueCompare !== 0) return rueCompare;
-      const numA = Number(a.numeroVoie) || 0;
-      const numB = Number(b.numeroVoie) || 0;
-      return numA - numB;
+      return a.numeroVoie.localeCompare(b.numeroVoie, "ar", { numeric: true });
     });
 
     for (let i = 0; i < lignesTriees.length; i += TAILLE_TOURNEE) {
