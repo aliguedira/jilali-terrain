@@ -1,0 +1,15 @@
+# Fichiers Excel contenant des données électorales : ne doivent JAMAIS
+# être ajoutés au dépôt (même par erreur), même dans un sous-dossier.
+*.xlsx
+*.xls
+
+# Standard Next.js / Node.js
+node_modules/
+.next/
+out/
+.env
+.env.local
+.env*.local
+*.tsbuildinfo
+.DS_Store
+npm-debug.log*
