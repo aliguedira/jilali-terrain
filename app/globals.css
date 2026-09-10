@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+/*
+  Palette neutre, pensée pour un usage tactile en conditions difficiles
+  (soirée, réseau faible, une seule main) plutôt que pour l'identité
+  visuelle de la campagne — cet outil n'est jamais vu par le public.
+*/
+@theme {
+  --color-brand-navy: #1e2a4a;
+  --color-brand-ink: #1b1918;
+  --color-brand-paper: #faf7f2;
+  --color-brand-line: #e2ddd3;
+  --color-brand-green: #1e7a3d;
+  --color-brand-red: #b3261e;
+  --color-brand-amber: #b8860b;
+
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+}
+
+html {
+  background: var(--color-brand-paper);
+  color-scheme: light;
+}
+
+body {
+  font-family: var(--font-sans);
+  /* Empêche le "zoom accidentel" au double-tap sur mobile, gênant pour
+     une saisie rapide d'une seule main. */
+  touch-action: manipulation;
+}
