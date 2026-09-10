@@ -7,14 +7,21 @@
  *   npm run import -- chemin/vers/fichier.xlsx
  *   npm run import -- chemin/vers/fichier.xlsx --dry-run
  *   npm run import -- chemin/vers/fichier.xlsx --centres "نص1,نص2"
+ *   npm run import -- chemin/vers/fichier.xlsx --sql-out=import.sql
  *
- * Variables d'environnement requises (mêmes que le site, voir README) :
- *   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+ * Variables d'environnement requises pour l'écriture directe en base
+ * (mêmes que le site, voir README) : SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+ * Avec --sql-out, ces variables ne sont pas nécessaires : le script
+ * écrit un fichier .sql (à exécuter une seule fois, sur une base vide)
+ * au lieu de se connecter à Supabase.
  *
  * Ce script ne journalise JAMAIS un nom, une adresse ou un numéro de
- * téléphone : seulement des compteurs.
+ * téléphone sur la sortie standard (compteurs uniquement) — le mode
+ * --sql-out écrit ces informations dans le fichier .sql demandé, pas
+ * sur la sortie standard.
  */
-import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createClient } from "@supabase/supabase-js";
 import * as XLSX from "xlsx";
 import type { Database } from "../lib/database.types";
@@ -71,14 +78,60 @@ function parseArgs(argv: string[]) {
     : DEFAULT_CENTRES;
   const feuilleArg = argv.find((a) => a.startsWith("--feuille="));
   const nomFeuille = feuilleArg ? feuilleArg.slice("--feuille=".length) : FEUILLE_LISTE_PAR_DEFAUT;
+  const sqlOutArg = argv.find((a) => a.startsWith("--sql-out="));
+  const sqlOut = sqlOutArg ? sqlOutArg.slice("--sql-out=".length) : null;
   const cheminFichier = positional[0];
   if (!cheminFichier) {
     console.error(
-      "Usage : npm run import -- chemin/vers/fichier.xlsx [--dry-run] [--centres=\"نص1,نص2\"] [--feuille=\"nom\"]",
+      "Usage : npm run import -- chemin/vers/fichier.xlsx [--dry-run] [--centres=\"نص1,نص2\"] [--feuille=\"nom\"] [--sql-out=chemin.sql]",
     );
     process.exit(1);
   }
-  return { cheminFichier, dryRun, centres, nomFeuille };
+  return { cheminFichier, dryRun, centres, nomFeuille, sqlOut };
+}
+
+/** Échappe une valeur texte pour du SQL (guillemets simples doublés). */
+function sqlStr(v: string | null): string {
+  if (v === null) return "null";
+  return `'${v.replace(/'/g, "''")}'`;
+}
+function sqlBool(v: boolean): string {
+  return v ? "true" : "false";
+}
+
+/**
+ * Trie les portes d'un bureau et les découpe en tournées de
+ * TAILLE_TOURNEE portes maximum. Partagé entre le mode --sql-out et
+ * l'écriture directe en base, pour que les deux produisent exactement
+ * le même découpage.
+ */
+function construireTournees(lignes: LigneImportee[]): {
+  numeroTournee: number;
+  ruePrincipale: string | null;
+  portes: LigneImportee[];
+}[] {
+  // { numeric: true } fait que les nombres inclus dans le texte se
+  // comparent comme des nombres et non lettre par lettre : "قطاع 2"
+  // passe bien avant "قطاع 12".
+  const triees = [...lignes].sort((a, b) => {
+    const rueCompare = a.rue.localeCompare(b.rue, "ar", { numeric: true });
+    if (rueCompare !== 0) return rueCompare;
+    return a.numeroVoie.localeCompare(b.numeroVoie, "ar", { numeric: true });
+  });
+
+  const tournees: { numeroTournee: number; ruePrincipale: string | null; portes: LigneImportee[] }[] = [];
+  for (let i = 0; i < triees.length; i += TAILLE_TOURNEE) {
+    const chunk = triees.slice(i, i + TAILLE_TOURNEE);
+    const compteRues = new Map<string, number>();
+    for (const l of chunk) compteRues.set(l.rue, (compteRues.get(l.rue) ?? 0) + 1);
+    const ruePrincipale = [...compteRues.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+    tournees.push({
+      numeroTournee: Math.floor(i / TAILLE_TOURNEE) + 1,
+      ruePrincipale,
+      portes: chunk,
+    });
+  }
+  return tournees;
 }
 
 /** Essaie plusieurs façons de lire une date de naissance. */
@@ -117,7 +170,7 @@ function readRows(cheminFichier: string, nomFeuille: string): Record<string, unk
 }
 
 function main() {
-  const { cheminFichier, dryRun, centres, nomFeuille } = parseArgs(process.argv.slice(2));
+  const { cheminFichier, dryRun, centres, nomFeuille, sqlOut } = parseArgs(process.argv.slice(2));
 
   console.log(`Lecture du fichier... (feuille "${nomFeuille}", périmètre : ${centres.length} centre(s))`);
   const rawRows = readRows(cheminFichier, nomFeuille);
@@ -210,6 +263,11 @@ function main() {
     return;
   }
 
+  if (sqlOut) {
+    ecrireSql(sqlOut, bureauxMap);
+    return;
+  }
+
   const url = process.env.SUPABASE_URL;
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !serviceRoleKey) {
@@ -219,6 +277,53 @@ function main() {
   const supabase = createClient<Database>(url, serviceRoleKey, { auth: { persistSession: false } });
 
   void importerEnBase(supabase, bureauxMap);
+}
+
+/**
+ * Écrit un fichier .sql à exécuter une seule fois, sur une base vide
+ * (les identifiants sont générés ici, pas de gestion de doublons).
+ * N'a besoin d'aucune variable d'environnement Supabase.
+ */
+function ecrireSql(
+  cheminSortie: string,
+  bureauxMap: Map<string, { centreVote: string; numeroBureau: string; arrondissement: string; lignes: LigneImportee[] }>,
+) {
+  const lignesSql: string[] = [
+    "-- Import généré automatiquement (scripts/import.ts --sql-out).",
+    "-- À exécuter UNE SEULE FOIS, sur une base vide (pas de gestion de doublons ici).",
+  ];
+  let bureauxCrees = 0;
+  let tourneesCreees = 0;
+  let portesCreees = 0;
+
+  for (const bureau of bureauxMap.values()) {
+    const bureauId = randomUUID();
+    bureauxCrees++;
+    lignesSql.push(
+      `insert into bureaux (id, centre_vote, numero_bureau, arrondissement, nombre_inscrits) values (${sqlStr(bureauId)}, ${sqlStr(bureau.centreVote)}, ${sqlStr(bureau.numeroBureau)}, ${sqlStr(bureau.arrondissement || null)}, ${bureau.lignes.length});`,
+    );
+
+    for (const tournee of construireTournees(bureau.lignes)) {
+      const tourneeId = randomUUID();
+      tourneesCreees++;
+      lignesSql.push(
+        `insert into tournees (id, bureau_id, numero_tournee, rue_principale, nombre_portes) values (${sqlStr(tourneeId)}, ${sqlStr(bureauId)}, ${tournee.numeroTournee}, ${sqlStr(tournee.ruePrincipale)}, ${tournee.portes.length});`,
+      );
+
+      const valeurs = tournee.portes.map(
+        (ligne, ordre) =>
+          `(${sqlStr(randomUUID())}, ${sqlStr(tourneeId)}, ${sqlStr(bureauId)}, ${sqlStr(ligne.adresseBrute)}, ${sqlStr(ligne.rue)}, ${sqlStr(ligne.numeroVoie || null)}, ${sqlStr(ligne.nom)}, ${sqlStr(ligne.prenom)}, ${sqlStr(ligne.trancheAge)}, ${sqlBool(ligne.immeuble)}, ${ordre})`,
+      );
+      lignesSql.push(
+        `insert into portes (id, tournee_id, bureau_id, adresse_brute, rue, numero_voie, nom, prenom, tranche_age, immeuble, ordre) values\n  ${valeurs.join(",\n  ")};`,
+      );
+      portesCreees += tournee.portes.length;
+    }
+  }
+
+  writeFileSync(cheminSortie, lignesSql.join("\n\n") + "\n", "utf-8");
+  console.log(`Fichier SQL écrit : ${cheminSortie}`);
+  console.log(`Bureaux : ${bureauxCrees}, Tournées : ${tourneesCreees}, Portes : ${portesCreees}`);
 }
 
 async function importerEnBase(
@@ -250,34 +355,15 @@ async function importerEnBase(
     }
     bureauxCrees++;
 
-    // Tri par rue/groupe puis par numéro. { numeric: true } fait que
-    // les nombres inclus dans le texte se comparent comme des nombres
-    // et non lettre par lettre : "قطاع 2" passe bien avant "قطاع 12"
-    // (une comparaison textuelle classique les aurait mis dans le
-    // mauvais ordre, "1" < "2" caractère par caractère).
-    const lignesTriees = [...bureau.lignes].sort((a, b) => {
-      const rueCompare = a.rue.localeCompare(b.rue, "ar", { numeric: true });
-      if (rueCompare !== 0) return rueCompare;
-      return a.numeroVoie.localeCompare(b.numeroVoie, "ar", { numeric: true });
-    });
-
-    for (let i = 0; i < lignesTriees.length; i += TAILLE_TOURNEE) {
-      const chunk = lignesTriees.slice(i, i + TAILLE_TOURNEE);
-      const numeroTournee = Math.floor(i / TAILLE_TOURNEE) + 1;
-
-      // Rue principale = la rue la plus fréquente de la tournée.
-      const compteRues = new Map<string, number>();
-      for (const l of chunk) compteRues.set(l.rue, (compteRues.get(l.rue) ?? 0) + 1);
-      const ruePrincipale = [...compteRues.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
-
+    for (const tournee of construireTournees(bureau.lignes)) {
       const { data: tourneeRow, error: tourneeError } = await supabase
         .from("tournees")
         .upsert(
           {
             bureau_id: bureauRow.id,
-            numero_tournee: numeroTournee,
-            rue_principale: ruePrincipale,
-            nombre_portes: chunk.length,
+            numero_tournee: tournee.numeroTournee,
+            rue_principale: tournee.ruePrincipale,
+            nombre_portes: tournee.portes.length,
           },
           { onConflict: "bureau_id,numero_tournee" },
         )
@@ -285,12 +371,12 @@ async function importerEnBase(
         .single();
 
       if (tourneeError || !tourneeRow) {
-        console.error(`Échec de création de la tournée ${numeroTournee} du bureau ${bureau.numeroBureau} :`, tourneeError?.message);
+        console.error(`Échec de création de la tournée ${tournee.numeroTournee} du bureau ${bureau.numeroBureau} :`, tourneeError?.message);
         continue;
       }
       tourneesCreees++;
 
-      const portesAInserer = chunk.map((ligne, ordre) => ({
+      const portesAInserer = tournee.portes.map((ligne, ordre) => ({
         tournee_id: tourneeRow.id,
         bureau_id: bureauRow.id,
         adresse_brute: ligne.adresseBrute,
@@ -308,7 +394,7 @@ async function importerEnBase(
         .insert(portesAInserer, { count: "exact" });
 
       if (portesError) {
-        console.error(`Échec d'insertion des portes (tournée ${numeroTournee}, bureau ${bureau.numeroBureau}) :`, portesError.message);
+        console.error(`Échec d'insertion des portes (tournée ${tournee.numeroTournee}, bureau ${bureau.numeroBureau}) :`, portesError.message);
         continue;
       }
       portesCreees += count ?? portesAInserer.length;
