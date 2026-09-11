@@ -51,9 +51,14 @@ export default async function AdminTourneesPage() {
       <div className="mx-auto max-w-5xl">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <h1 className="text-lg font-bold text-brand-ink">Assigner les tournées</h1>
-          <Link href="/admin" className="rounded-lg border border-brand-navy px-4 py-2 text-sm font-semibold text-brand-navy">
-            ← Militants
-          </Link>
+          <nav className="flex gap-2">
+            <Link href="/admin" className="rounded-lg border border-brand-navy px-3 py-1.5 text-sm font-semibold text-brand-navy">
+              ← Militants
+            </Link>
+            <Link href="/admin/tableau-de-bord" className="rounded-lg border border-brand-navy px-3 py-1.5 text-sm font-semibold text-brand-navy">
+              Tableau de bord
+            </Link>
+          </nav>
         </div>
 
         {error ? (
