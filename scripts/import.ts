@@ -8,6 +8,7 @@
  *   npm run import -- chemin/vers/fichier.xlsx --dry-run
  *   npm run import -- chemin/vers/fichier.xlsx --centres "نص1,نص2"
  *   npm run import -- chemin/vers/fichier.xlsx --sql-out=import.sql
+ *   npm run import -- chemin/vers/fichier.xlsx --sql-out=import.sql --exclure-bureaux=42,43,44
  *
  * Variables d'environnement requises pour l'écriture directe en base
  * (mêmes que le site, voir README) : SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
@@ -80,14 +81,21 @@ function parseArgs(argv: string[]) {
   const nomFeuille = feuilleArg ? feuilleArg.slice("--feuille=".length) : FEUILLE_LISTE_PAR_DEFAUT;
   const sqlOutArg = argv.find((a) => a.startsWith("--sql-out="));
   const sqlOut = sqlOutArg ? sqlOutArg.slice("--sql-out=".length) : null;
+  // Bureaux déjà présents en base (numéro de bureau) à ne pas régénérer :
+  // portes n'a pas de contrainte d'unicité, donc les réinsérer créerait
+  // des doublons. À utiliser pour reprendre un import interrompu.
+  const exclureArg = argv.find((a) => a.startsWith("--exclure-bureaux="));
+  const exclureBureaux = exclureArg
+    ? new Set(exclureArg.slice("--exclure-bureaux=".length).split(",").map((n) => n.trim()))
+    : new Set<string>();
   const cheminFichier = positional[0];
   if (!cheminFichier) {
     console.error(
-      "Usage : npm run import -- chemin/vers/fichier.xlsx [--dry-run] [--centres=\"نص1,نص2\"] [--feuille=\"nom\"] [--sql-out=chemin.sql]",
+      "Usage : npm run import -- chemin/vers/fichier.xlsx [--dry-run] [--centres=\"نص1,نص2\"] [--feuille=\"nom\"] [--sql-out=chemin.sql] [--exclure-bureaux=42,43,44]",
     );
     process.exit(1);
   }
-  return { cheminFichier, dryRun, centres, nomFeuille, sqlOut };
+  return { cheminFichier, dryRun, centres, nomFeuille, sqlOut, exclureBureaux };
 }
 
 /** Échappe une valeur texte pour du SQL (guillemets simples doublés). */
@@ -170,7 +178,7 @@ function readRows(cheminFichier: string, nomFeuille: string): Record<string, unk
 }
 
 function main() {
-  const { cheminFichier, dryRun, centres, nomFeuille, sqlOut } = parseArgs(process.argv.slice(2));
+  const { cheminFichier, dryRun, centres, nomFeuille, sqlOut, exclureBureaux } = parseArgs(process.argv.slice(2));
 
   console.log(`Lecture du fichier... (feuille "${nomFeuille}", périmètre : ${centres.length} centre(s))`);
   const rawRows = readRows(cheminFichier, nomFeuille);
@@ -252,6 +260,17 @@ function main() {
 
   console.log(`${bureauxMap.size} bureau(x) distinct(s) dans le périmètre.`);
 
+  if (exclureBureaux.size > 0) {
+    let exclus = 0;
+    for (const [cle, bureau] of bureauxMap) {
+      if (exclureBureaux.has(bureau.numeroBureau)) {
+        bureauxMap.delete(cle);
+        exclus++;
+      }
+    }
+    console.log(`${exclus} bureau(x) exclu(s) car déjà importé(s) : ${[...exclureBureaux].join(", ")}.`);
+  }
+
   let totalTournees = 0;
   for (const bureau of bureauxMap.values()) {
     totalTournees += Math.ceil(bureau.lignes.length / TAILLE_TOURNEE);
@@ -290,7 +309,11 @@ function ecrireSql(
 ) {
   const lignesSql: string[] = [
     "-- Import généré automatiquement (scripts/import.ts --sql-out).",
-    "-- À exécuter UNE SEULE FOIS, sur une base vide (pas de gestion de doublons ici).",
+    "-- Les identifiants sont fixés ici (randomUUID côté script) : ce fichier peut être",
+    "-- découpé en morceaux et chaque insertion bureaux/tournees est protégée par",
+    "-- ON CONFLICT DO NOTHING (rejouer un morceau par erreur est donc sans risque pour",
+    "-- ces deux tables). Ce n'est PAS le cas pour les portes (pas de contrainte",
+    "-- d'unicité) : ne jamais exécuter deux fois le même bloc \"insert into portes\".",
   ];
   let bureauxCrees = 0;
   let tourneesCreees = 0;
@@ -300,22 +323,25 @@ function ecrireSql(
     const bureauId = randomUUID();
     bureauxCrees++;
     lignesSql.push(
-      `insert into bureaux (id, centre_vote, numero_bureau, arrondissement, nombre_inscrits) values (${sqlStr(bureauId)}, ${sqlStr(bureau.centreVote)}, ${sqlStr(bureau.numeroBureau)}, ${sqlStr(bureau.arrondissement || null)}, ${bureau.lignes.length});`,
+      `insert into bureaux (id, centre_vote, numero_bureau, arrondissement, nombre_inscrits) values (${sqlStr(bureauId)}, ${sqlStr(bureau.centreVote)}, ${sqlStr(bureau.numeroBureau)}, ${sqlStr(bureau.arrondissement || null)}, ${bureau.lignes.length}) on conflict (centre_vote, numero_bureau) do nothing;`,
     );
 
     for (const tournee of construireTournees(bureau.lignes)) {
       const tourneeId = randomUUID();
       tourneesCreees++;
       lignesSql.push(
-        `insert into tournees (id, bureau_id, numero_tournee, rue_principale, nombre_portes) values (${sqlStr(tourneeId)}, ${sqlStr(bureauId)}, ${tournee.numeroTournee}, ${sqlStr(tournee.ruePrincipale)}, ${tournee.portes.length});`,
+        `insert into tournees (id, bureau_id, numero_tournee, rue_principale, nombre_portes) values (${sqlStr(tourneeId)}, ${sqlStr(bureauId)}, ${tournee.numeroTournee}, ${sqlStr(tournee.ruePrincipale)}, ${tournee.portes.length}) on conflict (bureau_id, numero_tournee) do nothing;`,
       );
 
       const valeurs = tournee.portes.map(
         (ligne, ordre) =>
           `(${sqlStr(randomUUID())}, ${sqlStr(tourneeId)}, ${sqlStr(bureauId)}, ${sqlStr(ligne.adresseBrute)}, ${sqlStr(ligne.rue)}, ${sqlStr(ligne.numeroVoie || null)}, ${sqlStr(ligne.nom)}, ${sqlStr(ligne.prenom)}, ${sqlStr(ligne.trancheAge)}, ${sqlBool(ligne.immeuble)}, ${ordre})`,
       );
+      // portes n'a pas de contrainte d'unicité — le "where not exists" rend
+      // ce bloc sans effet si on le rejoue par erreur (déjà des portes pour
+      // cette tournée), au lieu de dupliquer silencieusement les lignes.
       lignesSql.push(
-        `insert into portes (id, tournee_id, bureau_id, adresse_brute, rue, numero_voie, nom, prenom, tranche_age, immeuble, ordre) values\n  ${valeurs.join(",\n  ")};`,
+        `insert into portes (id, tournee_id, bureau_id, adresse_brute, rue, numero_voie, nom, prenom, tranche_age, immeuble, ordre)\nselect * from (values\n  ${valeurs.join(",\n  ")}\n) as v(id, tournee_id, bureau_id, adresse_brute, rue, numero_voie, nom, prenom, tranche_age, immeuble, ordre)\nwhere not exists (select 1 from portes where tournee_id = ${sqlStr(tourneeId)});`,
       );
       portesCreees += tournee.portes.length;
     }
